@@ -1,0 +1,315 @@
+Fast LL(0) Parser Generation
+or how I won the JSON parsing dick measuring contest
+27 Jul 2016
+
+Thomas Wilde
+Senior Software Engineer, DU DA Group
+me@thwd.me
+
+* Background
+
+Lots of projects on Github that try to improve JSON parsing performance over `encoding/json`
+
+Two approaches:
+
+- Generate specialized code to parse JSON for a Go type definition
+- Parse on-demand by abstracting field-access
+
+* A little bit on JSON
+
+JSON has a neat little grammar with zero lookahead.
+
+Defines 5 (or 6) types:
+
+- null*
+- boolean
+- number
+- string
+- array
+- object
+
+'* in Javascript `typeof(null)` `===` `"object"`
+
+* Modeling the grammar
+
+We'll need the usual grammar constructs:
+
+- bytes (literals)
+- sequence
+- alternation
+- repetition
+- option
+- recursion
+
+* Modeling the grammar
+
+    type Node interface {
+        node() // private interface
+    }
+\.
+
+    // matches a specific byte
+    type Byte byte
+
+    // consumes and matches any one byte
+    type AnyByte struct{}
+
+    // matches against First, then against Second
+    type Sequence struct {
+        First, Second Node
+    }
+
+    // tries to match This and if it fails, tries That
+    // (behaves like PEG alternation)
+    type Alternation struct {
+        This, That Node
+    }
+
+* Modeling the grammar
+
+continued...
+
+    // matches Node zero or more times greedily
+    // (will never not match)
+    type Repetition struct {
+        Node Node
+    }
+
+    // matches Node zero or one time
+    // (will never not match)
+    type Option struct {
+        Node Node
+    }
+
+    // used to construct recursive grammar trees
+    type Recursion struct {
+        Node Node
+    }
+
+plus byte sets, which are just like character classes in regex.
+
+* Some simplifying constructors
+
+Using these provides convenience and some simple grammar tree simplifications
+
+    func Alternate(ns ...Node) Node
+
+    func Sequenciate(ns ...Node) Node
+
+    func Repeat(n Node) Node
+
+    func Optionally(n Node) Node
+
+    func Literal(s string) Node
+
+    func Bytes(bs ...byte) ByteSet
+
+    func NotBytes(bs ...byte) ByteSet
+
+    func ByteRange(from, to byte) ByteSet
+
+    func NotByteRange(from, to byte) ByteSet
+
+* The actual JSON grammar tree
+
+    b := Alternate(
+        Literal("true"),
+        Literal("false"),
+    )
+
+    u := Literal("null")
+
+* The actual JSON grammar tree
+
+    n := Sequenciate(
+        Optionally(Byte('-')),
+        Alternate(
+            Byte('0'),
+            Sequenciate(
+                ByteRange('1', '9'),
+                Repeat(ByteRange('0', '9')),
+            ),
+        ),
+        Optionally(Sequenciate(
+            Byte('.'),
+            Repeat(ByteRange('0', '9')),
+            Optionally(Sequenciate(
+                Bytes('E', 'e'),
+                Optionally(Bytes('+', '-')),
+                ByteRange('1', '9'),
+                Repeat(ByteRange('0', '9')),
+            )),
+        )),
+    )
+
+
+* The actual JSON grammar tree
+
+    h := Alternate(
+        ByteRange('A', 'F'),
+        ByteRange('a', 'f'),
+        ByteRange('0', '9'),
+    )
+
+    c := ByteRange(' ', '~').Intersection(NotBytes('\\', '"'))
+
+    s := Sequenciate(
+        Byte('"'),
+        Repeat(Alternate(
+            Sequenciate(Byte('\\'), Alternate(
+                Sequenciate(Byte('u'), h, h, h, h),
+                Bytes('"', '\\', '/', 'b', 'f', 'n', 'r', 't'),
+            )),
+            Sequenciate(c, Repeat(c)),
+        )),
+        Byte('"'),
+    )
+
+    x := &Recursion{}
+
+* The actual JSON grammar tree
+
+    a := Sequenciate(
+        Byte('['),
+        Optionally(Sequenciate(
+            x,
+            Repeat(Sequenciate(
+                Byte(','), x,
+            )),
+        )),
+        Byte(']'),
+    )
+
+    o := Sequenciate(
+        Byte('{'),
+        Optionally(Sequenciate(
+            s, Byte(':'), x,
+            Repeat(Sequenciate(
+                Byte(','),
+                s, Byte(':'), x,
+            )),
+        )),
+        Byte('}'),
+    )
+
+    x.Node = Alternate(o, a, s, b, n, u)
+
+* Labelization
+
+Our goal is to generate `goto`s. So we need to transform this grammar tree into labels.
+
+
+    type Label interface {
+        Id() Id
+        label() // private interface
+    }
+
+    type Byte struct {
+        id          Id
+        Byte        byte
+        Match, Fail Id
+    }
+
+    type Any struct {
+        id          Id
+        Match, Fail Id
+    }
+
+    type Sequence struct {
+        id            Id
+        First, Second Id
+    }
+
+* Labelization
+
+continued
+
+    type Alternation struct {
+        id         Id
+        This, That Id
+    }
+
+    type Repetition struct {
+        id   Id
+        Node Id
+    }
+
+    type Option struct {
+        id   Id
+        Node Id
+    }
+
+    type Recursion struct {
+        id          Id
+        Match, Fail Id
+    }
+
+
+* The actual labeling process
+
+Is a bit involved... it's on Github.
+
+High-level description:
+
+- traverse grammar tree in post-order
+- push each visited node as a label on a stack
+- sequence, alternation and so on pop labels off the stack
+- results in slice of labels
+
+
+* Linking the labels together (preamble)
+
+Please note that the way I wrote the following method is retarded.
+
+* Linking the labels together
+
+This is the stage that harnesses the simplicity of JSON's grammar.
+
+    func LinkLabels(ls []labels.Label, m, f labels.Id) labels.Id {
+        x := len(ls) - 1
+        switch t := ls[x].(type) {
+        /* ... */
+        case labels.Sequence:
+            s := LinkLabels(labelsUpTo(ls, t.Second), m, f)
+            r := LinkLabels(labelsUpTo(ls, t.First), s, f)
+            return r
+        case labels.Alternation:
+            s := LinkLabels(labelsUpTo(ls, t.That), m, f)
+            r := LinkLabels(labelsUpTo(ls, t.This), m, s)
+            return r
+        case labels.Repetition:
+            s := LinkLabels(labelsUpTo(ls, t.Node), t.Node, m)
+            s = LinkLabels(labelsUpTo(ls, t.Node), s, m)
+            return s
+        case labels.Option:
+            return LinkLabels(labelsUpTo(ls, t.Node), m, m)
+        /* ... */
+        }
+    }
+
+* Output the parser
+
+Straightforward...
+
+- Create template Go program.
+- Pass linked labels to template.
+- Add gotos in front.
+- Compile, run against big JSON file.
+
+  $ time ./parser.bin
+    169202432 true
+
+    real    0m0.353s
+    user    0m0.345s
+    sys 0m0.064s
+
+169202432 bytes in 0.353 seconds ~ 457.12 MB/s
+
+
+* Also, I cheated
+
+Because I'm not actually interpreting the JSON and converting it to Go values.
+
+This feature is trivial to add... so I don't think I'm gonna.
+
+Still would be nice to see how it impacts performance.

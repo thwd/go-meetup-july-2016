@@ -1,0 +1,99 @@
+package main
+
+import (
+    "fmt"
+    "io/ioutil"
+    "os"
+    "unsafe"
+)
+
+func main() {
+     f, _ := os.Open("example-data.json")
+     bs, _ := ioutil.ReadAll(f)
+     parse(bs)
+}
+
+func parse(bs []byte) {
+    p := uintptr(*(*unsafe.Pointer)(unsafe.Pointer(&bs)))
+    x, k := f(p, 0, uintptr(len(bs)))
+    fmt.Println(x, k)
+    if int(x) != len(bs) {
+       fmt.Println("partial match",x," out of ", len(bs))
+    }
+}
+
+
+func f(base, offset, length uintptr) (uintptr, bool) {
+
+    goto s{{.EntryPoint}}
+
+{{ range .Labels }}
+    {{ if eq ( LabelType . ) "Recursion" }}
+
+        s{{.Id}}: // {{LabelType .}}
+            // fmt.Println({{.Id}})
+            if x, k := f(base, offset, length); k {
+                offset = x
+                goto s{{ StructField "Match" . }}
+            }
+            goto s{{ StructField "Fail" . }}
+            // goto s{{.Id}} d
+
+    {{ else if eq ( LabelType . ) "ByteSet" }}
+
+        s{{.Id}}: // {{LabelType .}}
+            // fmt.Println({{.Id}})
+            {{ if (ByteSetEmpty .) }}
+                goto s{{ StructField "Fail" . }}
+            {{ else }}
+                {
+                    b := *((*byte)(unsafe.Pointer(base + offset)))
+                    if offset < length && ({{ range ( ByteSetRanges . ) }} (b >= {{ index . 0 }} && b <= {{ index . 1 }}) || {{ end }} false) {
+                        offset++
+                        goto s{{ StructField "Match" . }}
+                    }
+                    goto s{{ StructField "Fail" . }}
+                }
+            {{ end }}
+            // goto s{{.Id}} d
+
+    {{ else if eq ( LabelType . ) "Byte" }}
+        s{{.Id}}: // {{LabelType .}}
+            // fmt.Println({{.Id}})
+            if offset < length && *((*byte)(unsafe.Pointer(base + offset))) == {{ StructField "Byte" . }} {
+                offset++
+                goto s{{ StructField "Match" . }}
+            }
+            goto s{{ StructField "Fail" . }}
+            // goto s{{.Id}} d
+
+    {{ else if eq ( LabelType . ) "Any" }}
+        s{{.Id}}: // {{LabelType .}}
+            // fmt.Println({{.Id}})
+            if offset < length {
+                offset++
+                goto s{{ StructField "Match" . }}
+            }
+            goto s{{ StructField "Fail" . }}
+            // goto s{{.Id}} d
+
+
+    {{ else if eq ( LabelType . ) "Match" }}
+        s{{.Id}}: // {{LabelType .}}
+            return offset, true
+
+    {{ else if eq ( LabelType . ) "Fail" }}
+        s{{.Id}}: // {{LabelType .}}
+            return offset, false
+
+    {{ else if eq ( LabelType . ) "Repetition" }}
+    {{ else if eq ( LabelType . ) "Alternation" }}
+    {{ else if eq ( LabelType . ) "Option" }}
+    {{ else if eq ( LabelType . ) "Sequence" }}
+    {{ end }}
+{{ end }}
+
+    panic("never reached")
+
+}
+
